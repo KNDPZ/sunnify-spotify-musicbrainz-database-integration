@@ -37,6 +37,29 @@ It is a desktop GUI built with Python and PyQt6, and every binary doubles as a h
 
 ---
 
+## Windows fork: MusicBrainz metadata enrichment
+
+The Windows desktop build includes one optional feature: **MusicBrainz metadata enrichment**.
+In **Settings (⚙)** you can enable or disable enrichment, choose the **MusicBrainz
+Database Folder**, and choose **Download official database archives**. When **Add Meta
+Tags** is enabled (checked by default on Windows), every completed song is checked
+against MusicBrainz; missing supported fields such as **genre, album artist, ISRC,
+label, release country, disc/track totals, original release date, composer/lyricist
+(where documented), and MusicBrainz IDs** are added to the file. Spotify's existing
+title, artist, album and cover art are not overwritten. MP3, M4A, FLAC, Opus and
+WAV are supported.
+
+**Important:** MusicBrainz's official downloads are *very large PostgreSQL
+archives*, not a directly usable offline tag database. The archive button only
+saves/verifies those archives; automatic tagging uses MusicBrainz's rate-limited
+web service and keeps a separate, queryable SQLite cache in the folder you choose.
+Previously cached matches work offline; new uncached songs need internet access.
+The archives are optional for tagging. The app never claims all missing metadata
+exists for every track or creates made-up values. See
+[Windows MusicBrainz notes](docs/MUSICBRAINZ_WINDOWS.md) for details and build steps.
+
+---
+
 ## Download
 
 | Platform | Get it | Notes |

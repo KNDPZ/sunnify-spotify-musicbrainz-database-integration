@@ -41,6 +41,11 @@ from logging.handlers import RotatingFileHandler
 import requests
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import APIC, ID3
+from musicbrainz_metadata import (
+    DownloadCancelled, MusicBrainzClient, MusicBrainzDumpDownloader,
+    default_database_folder,
+)
+from musicbrainz_tags import write_extra, write_ogg_opus, write_wave
 from PyQt6.QtCore import (
     QEasingCurve,
     QPropertyAnimation,
@@ -347,6 +352,9 @@ class _Setting:
 # here reaches the CLI with zero CLI changes (the dialog row stays bespoke).
 SETTINGS = (
     _Setting("download_path", None, "path", help="where downloads land"),
+    _Setting("musicbrainz_path", None, "path", help="where MusicBrainz data and cache live"),
+    _Setting("musicbrainz_enabled", sys.platform == "win32", "bool",
+             help="fill missing audio tags using MusicBrainz on Windows"),
     _Setting(
         "format",
         "mp3",
@@ -1528,6 +1536,7 @@ class MusicScraper(QThread):
             "cover": cover_url or "",
             "file": filepath,
             "trackNumber": track_num,
+            "durationMs": track.duration_ms,
         }
 
         # Preview panel shows whichever track most recently started; the
@@ -1871,6 +1880,7 @@ class MusicScraper(QThread):
             "cover": cover_url or "",
             "file": filepath,
             "trackNumber": 1,
+            "durationMs": track.duration_ms,
         }
 
         self.song_meta.emit(dict(song_meta))
@@ -2001,12 +2011,14 @@ def _write_metadata_mp3(filename: str, tags: dict, cover_bytes: bytes | None) ->
          before saving as v2.3 https://mutagen.readthedocs.io/en/latest/api/id3.html
     """
     audio = EasyID3(filename)
-    audio["title"] = tags.get("title", "")
-    audio["artist"] = tags.get("artists", "")
-    audio["album"] = tags.get("album", "")
-    audio["date"] = tags.get("releaseDate", "")
+    for field, value in (
+        ("title", tags.get("title")), ("artist", tags.get("artists")),
+        ("album", tags.get("album")), ("date", tags.get("releaseDate")),
+    ):
+        if value and not audio.get(field):
+            audio[field] = str(value)
     track_num = tags.get("trackNumber") or 0
-    if track_num:
+    if track_num and not audio.get("tracknumber"):
         audio["tracknumber"] = str(track_num)
     # EasyID3.save() defaults to v2.4 + UTF-8. Passing v2_version=3 tells
     # mutagen to downgrade text frames to a v2.3-allowed encoding (UTF-16
@@ -2037,14 +2049,14 @@ def _write_metadata_m4a(filename: str, tags: dict, cover_bytes: bytes | None) ->
     from mutagen.mp4 import MP4, MP4Cover
 
     audio = MP4(filename)
-    audio["\xa9nam"] = tags.get("title", "")
-    audio["\xa9ART"] = tags.get("artists", "")
-    audio["\xa9alb"] = tags.get("album", "")
-    date = tags.get("releaseDate", "")
-    if date:
-        audio["\xa9day"] = date
+    for atom, value in (
+        ("\xa9nam", tags.get("title")), ("\xa9ART", tags.get("artists")),
+        ("\xa9alb", tags.get("album")), ("\xa9day", tags.get("releaseDate")),
+    ):
+        if value and not audio.get(atom):
+            audio[atom] = [str(value)]
     track_num = tags.get("trackNumber") or 0
-    if track_num:
+    if track_num and not audio.get("trkn"):
         audio["trkn"] = [(int(track_num), 0)]
     if cover_bytes:
         mime = _detect_image_mime(cover_bytes)
@@ -2066,14 +2078,14 @@ def _write_metadata_flac(filename: str, tags: dict, cover_bytes: bytes | None) -
     from mutagen.flac import FLAC, Picture
 
     audio = FLAC(filename)
-    audio["title"] = tags.get("title", "")
-    audio["artist"] = tags.get("artists", "")
-    audio["album"] = tags.get("album", "")
-    date = tags.get("releaseDate", "")
-    if date:
-        audio["date"] = date
+    for field, value in (
+        ("title", tags.get("title")), ("artist", tags.get("artists")),
+        ("album", tags.get("album")), ("date", tags.get("releaseDate")),
+    ):
+        if value and not audio.get(field):
+            audio[field] = str(value)
     track_num = tags.get("trackNumber") or 0
-    if track_num:
+    if track_num and not audio.get("tracknumber"):
         audio["tracknumber"] = str(track_num)
     if cover_bytes:
         # add_picture() appends; clear first so a re-tag doesn't stack duplicate covers
@@ -2097,10 +2109,12 @@ _METADATA_WRITERS = {
 class WritingMetaTagsThread(QThread):
     tags_success = pyqtSignal(str)
 
-    def __init__(self, tags, filename):
+    def __init__(self, tags, filename, *, musicbrainz_enabled=False, musicbrainz_path=None):
         super().__init__()
         self.tags = tags
         self.filename = filename
+        self.musicbrainz_enabled = musicbrainz_enabled
+        self.musicbrainz_path = musicbrainz_path
 
     def run(self):
         """Write tags + cover art synchronously, dispatching on file extension.
@@ -2113,14 +2127,31 @@ class WritingMetaTagsThread(QThread):
         try:
             log.info("writing tags: %s", self.filename)
             ext = os.path.splitext(self.filename)[1].lower()
+            tags = dict(self.tags)
+            if self.musicbrainz_enabled:
+                tags = MusicBrainzClient(self.musicbrainz_path or default_database_folder()).enrich(
+                    tags, duration_ms=tags.get("durationMs")
+                )
             writer = _METADATA_WRITERS.get(ext)
-            if writer is None:
+            if writer is None and not self.musicbrainz_enabled:
                 self.tags_success.emit("Tags skipped (unsupported container)")
                 return
-
-            cover_bytes = _fetch_cover_bytes(self.tags.get("cover", ""))
-            writer(self.filename, self.tags, cover_bytes)
-            self.tags_success.emit("Tags added successfully")
+            cover_bytes = _fetch_cover_bytes(tags.get("cover", ""))
+            if writer is not None:
+                writer(self.filename, tags, cover_bytes)
+                if self.musicbrainz_enabled:
+                    write_extra(self.filename, tags)
+            elif ext == ".opus":
+                write_ogg_opus(self.filename, tags, cover_bytes)
+            elif ext == ".wav":
+                write_wave(self.filename, tags, cover_bytes)
+            else:
+                self.tags_success.emit("Tags skipped (unsupported container)")
+                return
+            if self.musicbrainz_enabled and tags.get("musicbrainzRecordingId"):
+                self.tags_success.emit("MusicBrainz tags added successfully")
+            else:
+                self.tags_success.emit("Tags added successfully")
         except Exception:
             log.error("tag write failed: %s", self.filename, exc_info=True)
 
@@ -2152,6 +2183,101 @@ class DownloadThumbnail(QThread):
         self.main_UI.CoverImg.show()
 
 
+class MusicBrainzDownloadWorker(QThread):
+    """Download very large files without blocking the settings window."""
+
+    progress = pyqtSignal(str, int, int, object, object, str)
+    outcome = pyqtSignal(str, bool)
+
+    def __init__(self, folder: str):
+        super().__init__()
+        self.folder = folder
+        self.cancel_event = threading.Event()
+
+    def run(self):
+        try:
+            MusicBrainzDumpDownloader(self.folder).download(
+                lambda *args: self.progress.emit(*args), self.cancel_event
+            )
+        except DownloadCancelled:
+            self.outcome.emit("Download paused. Press Download again to resume.", False)
+        except Exception as exc:
+            log.error("MusicBrainz database download failed", exc_info=True)
+            self.outcome.emit(f"Download failed: {exc}", False)
+        else:
+            self.outcome.emit("Database archives downloaded and verified.", True)
+
+
+class MusicBrainzDownloadDialog(QDialog):
+    """Progress and cancellation for optional official database archives."""
+
+    def __init__(self, parent, folder):
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QLabel, QProgressBar
+
+        self.setWindowTitle("Download MusicBrainz database")
+        self.setMinimumWidth(500)
+        self.worker = MusicBrainzDownloadWorker(folder)
+        self.current = QLabel("Preparing official MusicBrainz snapshot...")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.summary = QLabel("Downloading core database and derived tags (many GB).")
+        self.summary.setWordWrap(True)
+        self.cancel_button = QPushButton("Pause download")
+        self.cancel_button.clicked.connect(self._cancel)
+        layout = QVBoxLayout(self)
+        for widget in (self.current, self.progress_bar, self.summary, self.cancel_button):
+            layout.addWidget(widget)
+        self.worker.progress.connect(self._update)
+        self._result = None
+        self.worker.outcome.connect(self._outcome)
+        self.worker.finished.connect(self._finish)
+        self.worker.start()
+
+    def _update(self, name, index, total, received, expected, state):
+        self.current.setText(f"{index + 1}/{total}: {name} — {state}")
+        if expected:
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(min(int(received / expected * 1000), 1000))
+            self.summary.setText(f"{received / (1024**3):.2f} / {expected / (1024**3):.2f} GiB")
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.summary.setText(f"{received / (1024**3):.2f} GiB downloaded")
+
+    def _outcome(self, message: str, success: bool):
+        self.current.setText(message)
+        self._result = success
+        self.cancel_button.setText("Closing...")
+        self.cancel_button.setEnabled(False)
+        self.progress_bar.setRange(0, 1000)
+        if success:
+            self.progress_bar.setValue(1000)
+
+    def _finish(self):
+        self.cancel_button.clicked.disconnect()
+        self.cancel_button.clicked.connect(self.accept)
+        self.cancel_button.setText("Close")
+        self.cancel_button.setEnabled(True)
+
+    def _cancel(self):
+        self.worker.cancel_event.set()
+        self.cancel_button.setText("Pausing...")
+        self.cancel_button.setEnabled(False)
+
+    def reject(self):
+        if self.worker.isRunning():
+            self._cancel()
+        else:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.worker.isRunning():
+            self._cancel()
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+
 class SettingsDialog(QDialog):
     """Download folder + audio format + quality in one dialog."""
 
@@ -2179,6 +2305,22 @@ class SettingsDialog(QDialog):
         folder_row = QHBoxLayout()
         folder_row.addWidget(self._folder_label, 1)
         folder_row.addWidget(browse)
+
+        self._mb_path_label = QLineEdit(
+            self._config.get("musicbrainz_path") or default_database_folder()
+        )
+        self._mb_path_label.setReadOnly(True)
+        self._mb_path_label.setToolTip(self._mb_path_label.text())
+        self._mb_path_label.setCursorPosition(0)
+        self._mb_browse = QPushButton("Choose folder")
+        self._mb_browse.clicked.connect(self._choose_musicbrainz_folder)
+        self._mb_path_row = QHBoxLayout()
+        self._mb_path_row.addWidget(self._mb_path_label, 1)
+        self._mb_path_row.addWidget(self._mb_browse)
+        self._mb_enable = QCheckBox()
+        self._mb_enable.setChecked(self._config.get("musicbrainz_enabled", True))
+        self._mb_download = QPushButton("Download official database archives...")
+        self._mb_download.clicked.connect(self._download_musicbrainz_database)
 
         self._format_cb = QComboBox()
         for key in SUPPORTED_FORMATS:
@@ -2309,6 +2451,31 @@ class SettingsDialog(QDialog):
                 "Korean) but may let an occasional cover or remix slip through.",
             ),
         ]
+        # This fork's MusicBrainz addition is Windows-only; preserve all
+        # other platforms' existing settings and download behavior.
+        if sys.platform == "win32":
+            _settings += [
+                (
+                    "MusicBrainz enrichment:", self._mb_enable,
+                    "Fill missing fields such as genre, album artist, label, ISRC, "
+                    "release country, disc counts and MusicBrainz IDs while tagging "
+                    "new downloads. Uses the online MusicBrainz service and caches "
+                    "verified results locally. Existing Spotify tags are preserved.",
+                ),
+                (
+                    "MusicBrainz database folder:", self._mb_path_row,
+                    "Location for the MusicBrainz SQLite lookup cache and optional "
+                    "official data archives. Separate from your music download folder.",
+                ),
+                (
+                    "MusicBrainz database:", self._mb_download,
+                    "Downloads the official core and derived PostgreSQL archives "
+                    "(roughly 8 GB compressed). These raw archives are NOT an "
+                    "offline searchable database: automatic tagging uses the "
+                    "MusicBrainz API and the local SQLite cache, and needs an "
+                    "internet connection for uncached songs. Archives are optional.",
+                ),
+            ]
         _fm = QFontMetrics(self.font())
         LABEL_W = max(_fm.horizontalAdvance(lbl) for lbl, _, _ in _settings) + 8
 
@@ -2433,6 +2600,35 @@ class SettingsDialog(QDialog):
             self._folder_label.setCursorPosition(0)
             self._folder_label.setToolTip(chosen)
 
+    def _choose_musicbrainz_folder(self):
+        start = self._mb_path_label.text()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select MusicBrainz Database Folder",
+            start if os.path.isdir(start) else os.path.expanduser("~"),
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks,
+        )
+        if folder:
+            self._mb_path_label.setText(folder)
+            self._mb_path_label.setCursorPosition(0)
+            self._mb_path_label.setToolTip(folder)
+
+    def _download_musicbrainz_database(self):
+        folder = self._mb_path_label.text()
+        confirm = QMessageBox.question(
+            self, "Download MusicBrainz database",
+            "Download MusicBrainz's official database archives to:\n"
+            f"{folder}\n\n"
+            "The two files total roughly 8 GB and can require considerable "
+            "time and free disk space. They are PostgreSQL archives, not an "
+            "offline search index. Song tagging still uses the MusicBrainz "
+            "online API and a local SQLite cache.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        MusicBrainzDownloadDialog(self, folder).exec()
+
     def _on_format_change(self, fmt: str) -> None:
         """Lossless formats (flac/wav) ignore the bitrate selector. The
         sample-rate selector only applies to formats that always transcode
@@ -2465,6 +2661,9 @@ class SettingsDialog(QDialog):
 
     def result_config(self) -> dict:
         self._config["download_path"] = self._folder_label.text()
+        if sys.platform == "win32":
+            self._config["musicbrainz_path"] = self._mb_path_label.text()
+            self._config["musicbrainz_enabled"] = self._mb_enable.isChecked()
         self._config["format"] = self._format_cb.currentText()
         self._config["quality"] = self._quality_cb.currentText().split()[0]
         self._config["include_track_number"] = self._include_track_number_cb.isChecked()
@@ -2759,6 +2958,15 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.download_path = self._config.get("download_path") or self._get_default_download_path()
         self._download_path_set = bool(self._config.get("download_path"))
         self._active_threads = []  # Keep references to running threads to prevent GC crashes
+        # MusicBrainz is rate-limited: queue tag work rather than starting one
+        # OS/QThread for each track in a 2,000-song playlist.
+        self._mb_tag_pool = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="sunnify-tags")
+            if sys.platform == "win32" else None
+        )
+        self._mb_tag_futures = set()
+        if sys.platform == "win32":
+            self.AddMetaDataCheck.setChecked(True)
         self._is_downloading = False  # Track download state for stop button
         self._queue: collections.deque[str] = collections.deque()
         self._current_link = ""
@@ -3140,11 +3348,30 @@ class MainWindow(QMainWindow, Ui_MainWindow):
     @pyqtSlot(dict)
     def add_song_META(self, song_meta):
         if self.AddMetaDataCheck.isChecked():
-            meta_thread = WritingMetaTagsThread(song_meta, song_meta["file"])
-            meta_thread.tags_success.connect(lambda x: self.statusMsg.setText(f"{x}"))
-            self._active_threads.append(meta_thread)
-            meta_thread.finished.connect(lambda: self._cleanup_thread(meta_thread))
-            meta_thread.start()
+            meta_thread = WritingMetaTagsThread(
+                song_meta, song_meta["file"],
+                musicbrainz_enabled=(
+                    sys.platform == "win32" and self._config.get("musicbrainz_enabled", False)
+                ),
+                musicbrainz_path=self._config.get("musicbrainz_path") or default_database_folder(),
+            )
+            if self._mb_tag_pool is not None and self._config.get("musicbrainz_enabled", False):
+                # Directly call the same synchronous tag writer inside a
+                # bounded pool, preserving the old QThread path elsewhere.
+                # A Qt signal to a QObject-bound slot is queued to the GUI.
+                meta_thread.tags_success.connect(self._on_tag_status)
+                job = self._mb_tag_pool.submit(meta_thread.run)
+                self._mb_tag_futures.add(job)
+                job.add_done_callback(self._mb_tag_futures.discard)
+            else:
+                meta_thread.tags_success.connect(self._on_tag_status)
+                self._active_threads.append(meta_thread)
+                meta_thread.finished.connect(lambda: self._cleanup_thread(meta_thread))
+                meta_thread.start()
+
+    @pyqtSlot(str)
+    def _on_tag_status(self, message):
+        self.statusMsg.setText(message)
 
     def _cleanup_thread(self, thread):
         """Remove finished thread from active list."""
@@ -3233,6 +3460,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         # QApplication.quit() unwinds the event loop cleanly so app.exec()
         # returns and the atexit session-end runs; sys.exit() inside a slot
         # raised SystemExit into qt's excepthook and logged a false crash
+        if self._mb_tag_pool is not None:
+            self._mb_tag_pool.shutdown(wait=False, cancel_futures=True)
         QApplication.quit()
 
     def Linkedin(self):

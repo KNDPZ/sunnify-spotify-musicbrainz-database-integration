@@ -134,8 +134,9 @@ class _RunState:
     "skipped, was already on disk" from "landed this run".
     """
 
-    def __init__(self, emitter: _Emitter):
+    def __init__(self, emitter: _Emitter, config: dict | None = None):
         self.emitter = emitter
+        self.config = config or {}
         self.landed: list[str] = []
         self.skipped: list[str] = []
         self.resume_skipped = 0
@@ -160,7 +161,14 @@ class _RunState:
             self.emitter.event("track_skipped", title=meta.get("title", ""), file=path)
             return
         # same tag writer the GUI uses, run synchronously (no thread started)
-        app.WritingMetaTagsThread(meta, path).run()
+        app.WritingMetaTagsThread(
+            meta, path,
+            musicbrainz_enabled=(
+                sys.platform == "win32" and self.config.get("musicbrainz_enabled", False)
+            ),
+            musicbrainz_path=self.config.get("musicbrainz_path")
+            or app.default_database_folder(),
+        ).run()
         if os.path.exists(path):
             self.landed.append(path)
             self.emitter.event(
@@ -264,7 +272,7 @@ def cmd_download(args) -> int:
 
     cancel_event = threading.Event()
     scraper = _build_scraper(args, cfg, cancel_event)
-    state = _RunState(emitter)
+    state = _RunState(emitter, cfg)
     # workers emit from pool threads; with no qt event loop running, queued
     # (auto) connections are never delivered, so force direct delivery
     from PyQt6.QtCore import Qt
